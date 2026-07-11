@@ -1,0 +1,54 @@
+{
+    "name": "gsebastiao/laravel-settings",
+    "description": "Pacote Laravel para gestão de settings com chave composta, hierarquia de contexto (global → tenant → user) e cast dinâmico.",
+    "type": "library",
+    "keywords": ["laravel", "settings", "configuration", "context", "multi-tenant"],
+    "homepage": "https://github.com/gsebastiao/laravel-settings",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Gsebastiao",
+            "email": "gsebastiao@users.noreply.github.com",
+            "homepage": "https://github.com/gsebastiao"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/database": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/support": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/cache": "^10.0|^11.0|^12.0|^13.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^8.0|^9.0|^10.0",
+        "phpunit/phpunit": "^10.0|^11.0|^12.0",
+        "laravel/pint": "^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Gsebastiao\\LaravelSettings\\": "src/"
+        },
+        "files": [
+            "src/helpers.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Gsebastiao\\LaravelSettings\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Gsebastiao\\LaravelSettings\\SettingsServiceProvider"
+            ],
+            "aliases": {
+                "Settings": "Gsebastiao\\LaravelSettings\\Facades\\Settings"
+            }
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
