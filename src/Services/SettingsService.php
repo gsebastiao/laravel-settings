@@ -11,10 +11,11 @@ use Illuminate\Support\Facades\Cache;
 class SettingsService implements SettingsRepository
 {
     public function __construct(
-        protected int     $cacheTtl    = 300,
-        protected string  $cachePrefix = 'settings:',
+        protected int $cacheTtl = 300,
+        protected string $cachePrefix = 'settings:',
         protected ?string $cacheDriver = null,
-    ) {}
+    ) {
+    }
 
     // ── Context factories ─────────────────────────────────────────────────────
 
@@ -28,13 +29,13 @@ class SettingsService implements SettingsRepository
         $prefix = config('settings.contexts.user', 'user');
 
         $id = match (true) {
-            is_int($user)    => $user,
+            is_int($user) => $user,
             is_object($user) => $user->getKey(),
-            default          => Auth::id()
-                ?? throw new \RuntimeException(
-                    '[gsebastiao/laravel-settings] Nenhum utilizador autenticado para userContext(). '
-                    . 'Passa o user explicitamente: SettingsService::userContext($user)'
-                ),
+            default => Auth::id()
+            ?? throw new \RuntimeException(
+                '[gsebastiao/laravel-settings] Nenhum utilizador autenticado para userContext(). '
+                . 'Passa o user explicitamente: SettingsService::userContext($user)'
+            ),
         };
 
         return $prefix . ':' . $id;
@@ -92,11 +93,11 @@ class SettingsService implements SettingsRepository
     // ── Escrita ───────────────────────────────────────────────────────────────
 
     public function set(
-        string  $dotKey,
-        mixed   $value,
-        string  $context = 'global',
-        ?string $cast    = null,
-        array   $options = []
+        string $dotKey,
+        mixed $value,
+        string $context = 'global',
+        ?string $cast = null,
+        array $options = []
     ): Setting {
         [$namespace, $key] = $this->parseDotKey($dotKey);
 
@@ -105,17 +106,17 @@ class SettingsService implements SettingsRepository
         $setting = Setting::updateOrCreate(
             [
                 'namespace' => $namespace,
-                'key'       => $key,
-                'context'   => $context,
+                'key' => $key,
+                'context' => $context,
             ],
             [
-                'value'          => $value,
-                'cast'           => $cast,
-                'is_locked'      => $options['is_locked']      ?? false,
+                'value' => $value,
+                'cast' => $cast,
+                'is_locked' => $options['is_locked'] ?? false,
                 'is_inheritable' => $options['is_inheritable'] ?? false,
-                'visibility'     => $options['visibility']     ?? 'editable',
-                'metadata'       => $options['metadata']       ?? null,
-                'updated_by'     => Auth::id(),
+                'visibility' => $options['visibility'] ?? 'editable',
+                'metadata' => $options['metadata'] ?? null,
+                'updated_by' => Auth::id(),
             ]
         );
 
@@ -130,8 +131,8 @@ class SettingsService implements SettingsRepository
 
         Setting::where([
             'namespace' => $namespace,
-            'key'       => $key,
-            'context'   => $context,
+            'key' => $key,
+            'context' => $context,
         ])->update(['is_locked' => true, 'updated_by' => Auth::id()]);
 
         $this->bustCache($namespace, $key, $context);
@@ -143,8 +144,8 @@ class SettingsService implements SettingsRepository
 
         Setting::where([
             'namespace' => $namespace,
-            'key'       => $key,
-            'context'   => $context,
+            'key' => $key,
+            'context' => $context,
         ])->delete();
 
         $this->bustCache($namespace, $key, $context);
@@ -180,23 +181,74 @@ class SettingsService implements SettingsRepository
      * como identificadores no corpo — compact('namespace') não conta como
      * uso de $namespace aos olhos dessa análise, por isso a variável nunca
      * é capturada e o compact() executa sem ela definida, lançando
-     * "Undefined variable $namespace" (ou key/context, dependendo da ordem).
+     * "Undefined variable" (ou key/context, dependendo da ordem).
      *
-     * Isto é mais visível em PHP 8.2+ com arrow functions (fn); closures
-     * tradicionais (function() use (...)) nunca tiveram este problema porque
-     * exigem `use` explícito.
+     * IMPORTANTE (2): o cache guarda um ARRAY primitivo, não a instância
+     * Eloquent Setting directamente — evita __PHP_Incomplete_Class quando a
+     * estrutura da classe muda entre versões do pacote com cache persistente
+     * (Redis/Memcached) activo.
+     *
+     * IMPORTANTE (3): o valor lido do cache é validado com is_array() antes
+     * de usar. Isto protege contra qualquer entrada corrompida ou de formato
+     * antigo que ainda esteja no driver de cache — por exemplo, se um worker
+     * PHP-FPM diferente gravou uma entrada com o código anterior antes do
+     * cache:clear propagar a todos os processos, ou se o driver de cache é
+     * partilhado entre deploys sem invalidação atómica. Em vez de deixar o
+     * forceFill() rebentar com TypeError, tratamos qualquer valor que não
+     * seja array (incluindo objectos, __PHP_Incomplete_Class, ou lixo) como
+     * cache miss: ignoramos e lemos a BD directamente, sem passar pelo
+     * Cache::remember() para essa chamada — o que também corrige a entrada
+     * na próxima escrita de cache.
+     *
+     * IMPORTANTE (4): "não existe na BD" é cacheado com um marcador sentinela
+     * (self::CACHE_MISS_MARKER), nunca com null bruto. Alguns drivers de
+     * cache — versões antigas da extensão Memcached, em particular — tratam
+     * put($key, null, $ttl) de forma inconsistente: nalgumas o valor é
+     * gravado normalmente, noutras a chamada é silenciosamente tratada como
+     * um forget(). Isso faria o "cache negativo" (evitar bater na BD outra
+     * vez para uma setting que sabemos não existir) nunca funcionar nesses
+     * drivers especificamente, sem qualquer erro visível — só mais queries
+     * do que o esperado. Guardar uma string sentinela em vez de null
+     * funciona de forma idêntica em file, redis, memcached e database.
      */
+    private const CACHE_MISS_MARKER = '__settings_miss__';
+
     protected function remember(string $namespace, string $key, string $context): ?Setting
     {
-        return $this->store()->remember(
-            $this->cacheKey($namespace, $key, $context),
-            $this->cacheTtl,
-            fn () => Setting::where([
+        $fetch = function () use ($namespace, $key, $context) {
+            $setting = Setting::where([
                 'namespace' => $namespace,
-                'key'       => $key,
-                'context'   => $context,
-            ])->first()
-        );
+                'key' => $key,
+                'context' => $context,
+            ])->first();
+
+            return $setting?->getAttributes();
+        };
+
+        $cacheKey = $this->cacheKey($namespace, $key, $context);
+        $cached = $this->store()->get($cacheKey);
+
+        if ($cached === self::CACHE_MISS_MARKER) {
+            return null;
+        }
+
+        // Cache miss normal, ou entrada corrompida/de formato antigo —
+        // nos dois casos lemos a BD e regravamos o cache com o formato certo.
+        if ($cached !== null && !is_array($cached)) {
+            $this->store()->forget($cacheKey);
+            $cached = null;
+        }
+
+        if ($cached === null) {
+            $cached = $fetch();
+            $this->store()->put($cacheKey, $cached ?? self::CACHE_MISS_MARKER, $this->cacheTtl);
+        }
+
+        if ($cached === null) {
+            return null;
+        }
+
+        return (new Setting())->forceFill($cached)->syncOriginal();
     }
 
     protected function bustCache(string $namespace, string $key, string $context): void
@@ -250,11 +302,11 @@ class SettingsService implements SettingsRepository
     protected function inferCast(mixed $value): string
     {
         return match (true) {
-            is_bool($value)  => 'bool',
-            is_int($value)   => 'int',
+            is_bool($value) => 'bool',
+            is_int($value) => 'int',
             is_float($value) => 'float',
             is_array($value) => 'json',
-            default          => config('settings.default_cast', 'string'),
+            default => config('settings.default_cast', 'string'),
         };
     }
 }
