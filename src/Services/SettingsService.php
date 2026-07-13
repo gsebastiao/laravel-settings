@@ -23,11 +23,6 @@ class SettingsService implements SettingsRepository
         return config('settings.contexts.default', 'global');
     }
 
-    /**
-     * Contexto do utilizador autenticado ou de um ID/Model específico.
-     *
-     * @param  int|object|null  $user
-     */
     public static function userContext(mixed $user = null): string
     {
         $prefix = config('settings.contexts.user', 'user');
@@ -45,9 +40,6 @@ class SettingsService implements SettingsRepository
         return $prefix . ':' . $id;
     }
 
-    /**
-     * Contexto de tenant/organização.
-     */
     public static function tenantContext(int $tenantId): string
     {
         $prefix = config('settings.contexts.tenant', 'tenant');
@@ -111,7 +103,11 @@ class SettingsService implements SettingsRepository
         $cast ??= $this->inferCast($value);
 
         $setting = Setting::updateOrCreate(
-            compact('namespace', 'key', 'context'),
+            [
+                'namespace' => $namespace,
+                'key'       => $key,
+                'context'   => $context,
+            ],
             [
                 'value'          => $value,
                 'cast'           => $cast,
@@ -132,8 +128,11 @@ class SettingsService implements SettingsRepository
     {
         [$namespace, $key] = $this->parseDotKey($dotKey);
 
-        Setting::where(compact('namespace', 'key', 'context'))
-            ->update(['is_locked' => true, 'updated_by' => Auth::id()]);
+        Setting::where([
+            'namespace' => $namespace,
+            'key'       => $key,
+            'context'   => $context,
+        ])->update(['is_locked' => true, 'updated_by' => Auth::id()]);
 
         $this->bustCache($namespace, $key, $context);
     }
@@ -142,14 +141,17 @@ class SettingsService implements SettingsRepository
     {
         [$namespace, $key] = $this->parseDotKey($dotKey);
 
-        Setting::where(compact('namespace', 'key', 'context'))->delete();
+        Setting::where([
+            'namespace' => $namespace,
+            'key'       => $key,
+            'context'   => $context,
+        ])->delete();
 
         $this->bustCache($namespace, $key, $context);
     }
 
     public function forgetContext(string $context): void
     {
-        // Obtém todas as chaves antes de apagar, para invalidar o cache individualmente
         $keys = Setting::where('context', $context)->get(['namespace', 'key']);
 
         Setting::where('context', $context)->delete();
@@ -168,16 +170,36 @@ class SettingsService implements SettingsRepository
             : Cache::store();
     }
 
+    /**
+     * IMPORTANTE: usa array literal ['namespace' => $namespace, ...] em vez de
+     * compact('namespace', 'key', 'context') dentro da arrow function.
+     *
+     * compact() lê variáveis pelo nome em runtime (via get_defined_vars()),
+     * não por referência sintáctica. O motor PHP decide o que uma arrow
+     * function captura analisando estaticamente quais variáveis aparecem
+     * como identificadores no corpo — compact('namespace') não conta como
+     * uso de $namespace aos olhos dessa análise, por isso a variável nunca
+     * é capturada e o compact() executa sem ela definida, lançando
+     * "Undefined variable $namespace" (ou key/context, dependendo da ordem).
+     *
+     * Isto é mais visível em PHP 8.2+ com arrow functions (fn); closures
+     * tradicionais (function() use (...)) nunca tiveram este problema porque
+     * exigem `use` explícito.
+     */
     protected function remember(string $namespace, string $key, string $context): ?Setting
     {
         return $this->store()->remember(
             $this->cacheKey($namespace, $key, $context),
             $this->cacheTtl,
-            fn () => Setting::where(compact('namespace', 'key', 'context'))->first()
+            fn () => Setting::where([
+                'namespace' => $namespace,
+                'key'       => $key,
+                'context'   => $context,
+            ])->first()
         );
     }
 
-    public function bustCache(string $namespace, string $key, string $context): void
+    protected function bustCache(string $namespace, string $key, string $context): void
     {
         $this->store()->forget($this->cacheKey($namespace, $key, $context));
     }
@@ -189,13 +211,6 @@ class SettingsService implements SettingsRepository
 
     // ── Helpers internos ──────────────────────────────────────────────────────
 
-    /**
-     * Cadeia de resolução do mais específico para o mais geral.
-     *
-     *  'user:42'  → ['user:42', 'global']
-     *  'tenant:5' → ['tenant:5', 'global']
-     *  'global'   → ['global']
-     */
     protected function buildContextChain(string $context): array
     {
         $global = static::globalContext();
@@ -208,12 +223,20 @@ class SettingsService implements SettingsRepository
     }
 
     /**
-     * 'namespace.key'     → ['namespace', 'key']
-     * 'mail.smtp.host'    → ['mail',      'smtp.host']
+     * Divide 'namespace.key' cortando no ÚLTIMO ponto, não no primeiro.
+     *
+     * Isto permite namespaces com múltiplos níveis:
+     *   'format.date_time.date'  → namespace='format.date_time', key='date'
+     *   'format.currency.symbol' → namespace='format.currency',  key='symbol'
+     *   'general.name'           → namespace='general',          key='name'
+     *
+     * Cortar no primeiro ponto (comportamento antigo) produzia
+     * namespace='format', key='date_time.date' — que nunca coincide com um
+     * registo gravado como namespace='format.date_time', key='date'.
      */
     protected function parseDotKey(string $dotKey): array
     {
-        $pos = strpos($dotKey, '.');
+        $pos = strrpos($dotKey, '.');
 
         if ($pos === false) {
             throw new \InvalidArgumentException(

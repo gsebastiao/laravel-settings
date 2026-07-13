@@ -1,0 +1,12 @@
+fix: correct closure variable capture and multi-level namespace parsing
+
+- Replace compact() with literal arrays inside remember(), set(), lock()
+  and forget() — arrow functions don't capture variables referenced only
+  via compact(), causing "Undefined variable" ErrorException at runtime
+  on PHP 8.4
+- Change parseDotKey() from strpos() to strrpos() so it splits on the
+  LAST dot instead of the first, enabling multi-level namespaces like
+  'format.date_time' and 'format.currency' to resolve correctly instead
+  of silently returning null
+
+Fixes settings lookup for any namespace with more than one dot segment.
