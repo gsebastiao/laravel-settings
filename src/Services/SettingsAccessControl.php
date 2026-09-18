@@ -2,186 +2,246 @@
 
 namespace Gsebastiao\LaravelSettings\Services;
 
+use BackedEnum;
+use Closure;
 use Gsebastiao\LaravelSettings\Models\Setting;
 use Gsebastiao\LaravelSettings\Models\SettingManager;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Collection;
+use InvalidArgumentException;
+use Stringable;
 
 /**
- * SettingsAccessControl — resolve a visibilidade final de uma setting para
- * um utilizador concreto.
+ * Decide o que um utilizador pode fazer com uma setting:
+ * 'hidden' (não vê), 'readonly' (vê) ou 'editable' (vê e altera).
  *
- * ── Lógica de resolução ──────────────────────────────────────────────────────
- *
- *   1. A tabela settings_managers existe e tem registo para este user/role?
- *        SIM → usa o visibility do pivot (readonly ou editable) — tem mais peso
- *        NÃO → passo 2
- *   2. Usa o visibility da própria setting (hidden|readonly|editable)
- *
- * Numa app simples que nunca correu a migration de settings_managers, o passo 1
- * é sempre "não" (verificado uma vez via SettingManager::tableExists() e
- * ignorado depois) — o custo extra é zero.
- *
- * ── Uso básico ────────────────────────────────────────────────────────────────
+ *   1. Parte da `visibility` da setting.
+ *   2. Se existir uma permissão (SettingManager::grant) para o utilizador, ou
+ *      para um dos seus roles, NESSE contexto, a permissão ganha. Permissão
+ *      directa ao utilizador ganha à do role.
+ *   3. Se a setting estiver bloqueada (lock) num contexto mais geral, fica no
+ *      máximo 'readonly' — não pode ser alterada aqui.
  *
  *   $access = app(SettingsAccessControl::class);
  *
- *   // Visibilidade final para o utilizador autenticado
- *   $access->visibilityFor('billing.plan', context: 'tenant:5', user: auth()->user());
- *   // → 'readonly' | 'editable' | 'hidden'
- *
- *   // Atalhos
- *   $access->canView('billing.plan', context: 'tenant:5', user: $user);   // bool
- *   $access->canEdit('billing.plan', context: 'tenant:5', user: $user);   // bool
- *
- *   // Filtrar uma lista de settings para o que o utilizador pode ver
- *   $visible = $access->filterVisible($settings, user: $user);
+ *   $access->visibilityFor('billing.plan', context: 'tenant:5', user: $user); // 'readonly'
+ *   $access->canView('billing.plan', context: 'tenant:5', user: $user);       // true
+ *   $access->canEdit('billing.plan', context: 'tenant:5', user: $user);       // false
  */
 class SettingsAccessControl
 {
+    protected static ?Closure $rolesResolver = null;
+
+    protected ?bool $pivotAvailable = null;
+
+    public function __construct(protected SettingsService $settings)
+    {
+    }
+
     /**
-     * Resolve a visibilidade final de uma setting para um utilizador.
+     * Define como obter os roles de um utilizador. Chama no boot() do
+     * AppServiceProvider (funciona com php artisan config:cache):
      *
-     * @param  string     $dotKey  'namespace.key'
-     * @param  string     $context Contexto da setting
-     * @param  Model|null $user    Utilizador a verificar; null = sem utilizador autenticado
+     *   SettingsAccessControl::resolveRolesUsing(fn ($user) => $user->roles->pluck('slug'));
+     *
+     * Por defeito usa $user->getRoleNames() (spatie/laravel-permission), se existir.
      */
-    public function visibilityFor(string $dotKey, string $context, ?Model $user = null): string
+    public static function resolveRolesUsing(?callable $resolver): void
     {
-        [$namespace, $key] = $this->parseDotKey($dotKey);
-
-        $setting = Setting::where(compact('namespace', 'key', 'context'))->first();
-
-        if ($setting === null) {
-            return 'hidden'; // setting inexistente é sempre invisível
-        }
-
-        return $this->resolve($setting, $user);
+        static::$rolesResolver = $resolver === null ? null : Closure::fromCallable($resolver);
     }
 
     /**
-     * Resolve a visibilidade a partir de uma instância Setting já carregada
-     * (evita uma query extra quando já tens o objecto em mãos).
+     * Visibilidade final ('hidden', 'readonly' ou 'editable'). Uma setting que
+     * não existe na cadeia de contextos é 'hidden'.
      */
-    public function resolve(Setting $setting, ?Model $user = null): string
+    public function visibilityFor(string $dotKey, string|array|null $context = null, ?Model $user = null): string
     {
-        // Cenário simples: tabela pivot nunca foi migrada → usa só o padrão
-        if (! SettingManager::tableExists() || $user === null) {
-            return $setting->visibility;
-        }
+        $chain = $this->settings->contextChain($context);
+        $setting = $this->settings->find($dotKey, $chain);
 
-        $pivotVisibility = $this->lookupPivot($setting, $user);
-
-        // O pivot, quando existe, sobrepõe sempre o visibility da setting —
-        // mesmo que a setting seja 'hidden', um gestor explícito tem acesso.
-        return $pivotVisibility ?? $setting->visibility;
+        return $setting === null ? 'hidden' : $this->resolve($setting, $user, $chain[0]);
     }
 
-    public function canView(string $dotKey, string $context, ?Model $user = null): bool
+    /**
+     * O mesmo que visibilityFor(), para uma Setting já carregada.
+     * $context é o contexto onde a setting vai ser mostrada (por defeito, o dela).
+     */
+    public function resolve(Setting $setting, ?Model $user = null, ?string $context = null): string
+    {
+        $context ??= $setting->context;
+        $grants = $user !== null && $this->pivotAvailable() ? $this->loadGrants($user, [$context]) : [];
+
+        return $this->decide($setting, $context, $grants);
+    }
+
+    public function canView(string $dotKey, string|array|null $context = null, ?Model $user = null): bool
     {
         return $this->visibilityFor($dotKey, $context, $user) !== 'hidden';
     }
 
-    public function canEdit(string $dotKey, string $context, ?Model $user = null): bool
+    public function canEdit(string $dotKey, string|array|null $context = null, ?Model $user = null): bool
     {
         return $this->visibilityFor($dotKey, $context, $user) === 'editable';
     }
 
     /**
-     * Filtra uma coleção de Settings, mantendo apenas as que o utilizador
-     * pode ver (visibility resolvido != 'hidden'). Útil para construir uma
-     * página de configurações que só mostra o que é relevante para o user.
+     * Mantém só as settings que o utilizador pode ver. Faz uma única query às
+     * permissões, seja qual for o tamanho da lista.
      *
-     * @param  \Illuminate\Support\Collection<int, Setting>  $settings
-     * @return \Illuminate\Support\Collection<int, Setting>
+     * @param  Collection<int, Setting>  $settings
+     * @return Collection<int, Setting>
      */
-    public function filterVisible(\Illuminate\Support\Collection $settings, ?Model $user = null): \Illuminate\Support\Collection
+    public function filterVisible(Collection $settings, ?Model $user = null, ?string $context = null): Collection
     {
-        return $settings->filter(
-            fn (Setting $setting) => $this->resolve($setting, $user) !== 'hidden'
-        )->values();
+        $grants = [];
+
+        if ($user !== null && $settings->isNotEmpty() && $this->pivotAvailable()) {
+            $contexts = $settings->map(fn (Setting $setting): string => $context ?? $setting->context)
+                ->unique()
+                ->values()
+                ->all();
+
+            $grants = $this->loadGrants($user, $contexts);
+        }
+
+        return $settings
+            ->filter(fn (Setting $setting): bool => $this->decide($setting, $context ?? $setting->context, $grants) !== 'hidden')
+            ->values();
     }
 
-    // ── Helpers internos ──────────────────────────────────────────────────────
+    // ── Internos ─────────────────────────────────────────────────────────────
 
     /**
-     * Procura no pivot por um registo do utilizador directamente, ou de
-     * qualquer um dos roles que ele tem. Utilizador tem prioridade sobre role
-     * quando ambos existem (mais específico ganha).
+     * @param  array<string, array<int, array{0: string, 1: string}>>  $grants
      */
-    protected function lookupPivot(Setting $setting, Model $user): ?string
+    protected function decide(Setting $setting, string $context, array $grants): string
     {
-        $base = SettingManager::where('namespace', $setting->namespace)
-            ->where('key', $setting->key)
-            ->where('context', $setting->context);
+        $visibility = in_array($setting->visibility, Setting::VISIBILITIES, true) ? $setting->visibility : 'hidden';
+        $visibility = $this->grantFor($grants, $setting->namespace, $setting->key, $context) ?? $visibility;
 
-        // 1. Match directo por user_id — mais específico, verificado primeiro
-        $userMatch = (clone $base)
-            ->where('manager_type', 'user')
-            ->where('manager_id', (string) $user->getKey())
-            ->first();
-
-        if ($userMatch !== null) {
-            return $userMatch->visibility;
+        if ($visibility === 'editable' && $setting->is_locked && $setting->context !== $context) {
+            return 'readonly';
         }
 
-        // 2. Match por qualquer um dos roles do utilizador.
-        // Nota: a ordenação por prioridade (editable > readonly) é feita em
-        // PHP, não em SQL, porque FIELD() só existe em MySQL — isto mantém
-        // o pacote portável entre SQLite, MySQL e PostgreSQL.
-        $roles = $this->resolveUserRoles($user);
-
-        if (empty($roles)) {
-            return null;
-        }
-
-        $roleMatches = (clone $base)
-            ->where('manager_type', 'role')
-            ->whereIn('manager_id', $roles)
-            ->get();
-
-        if ($roleMatches->isEmpty()) {
-            return null;
-        }
-
-        // Se o utilizador tiver vários roles com regras diferentes para a
-        // mesma setting, 'editable' ganha sobre 'readonly' (mais permissivo).
-        return $roleMatches->contains('visibility', 'editable')
-            ? 'editable'
-            : 'readonly';
+        return $visibility;
     }
 
     /**
-     * Resolve os roles do utilizador. Usa config('settings.resolve_roles') se
-     * definido, senão tenta getRoleNames() (compatível com spatie/laravel-permission).
-     * Retorna [] silenciosamente se nada disso existir — nunca quebra a app.
+     * Todas as permissões do utilizador e dos seus roles nestes contextos,
+     * numa só query.
      *
+     * @param  array<int, string>  $contexts
+     * @return array<string, array<int, array{0: string, 1: string}>>
+     */
+    protected function loadGrants(Model $user, array $contexts): array
+    {
+        $userId = (string) $user->getKey();
+        $roles = $this->rolesFor($user);
+
+        $rows = SettingManager::query()
+            ->whereIn('context', $contexts)
+            ->where(function ($query) use ($userId, $roles): void {
+                $query->where(fn ($query) => $query->where('manager_type', 'user')->where('manager_id', $userId));
+
+                if ($roles !== []) {
+                    $query->orWhere(fn ($query) => $query->where('manager_type', 'role')->whereIn('manager_id', $roles));
+                }
+            })
+            ->toBase()
+            ->get(['namespace', 'key', 'context', 'manager_type', 'visibility']);
+
+        $grants = [];
+
+        foreach ($rows as $row) {
+            $grants[$row->namespace . "\0" . $row->key . "\0" . $row->context][] = [$row->manager_type, $row->visibility];
+        }
+
+        return $grants;
+    }
+
+    /**
+     * @param  array<string, array<int, array{0: string, 1: string}>>  $grants
+     */
+    protected function grantFor(array $grants, string $namespace, string $key, string $context): ?string
+    {
+        $matches = $grants[$namespace . "\0" . $key . "\0" . $context] ?? [];
+
+        foreach ($matches as [$type, $visibility]) {
+            if ($type === 'user') {
+                return $visibility; // permissão directa ao utilizador tem prioridade
+            }
+        }
+
+        if ($matches === []) {
+            return null;
+        }
+
+        // Vários roles com regras diferentes: vale a mais permissiva.
+        foreach ($matches as [, $visibility]) {
+            if ($visibility === 'editable') {
+                return 'editable';
+            }
+        }
+
+        return 'readonly';
+    }
+
+    /**
      * @return array<int, string>
      */
-    protected function resolveUserRoles(Model $user): array
+    protected function rolesFor(Model $user): array
+    {
+        $resolver = static::$rolesResolver ?? $this->resolverFromConfig();
+
+        $roles = match (true) {
+            $resolver !== null => $resolver($user),
+            method_exists($user, 'getRoleNames') => $user->getRoleNames(),
+            default => [],
+        };
+
+        $names = [];
+
+        // Aceita array, Collection (com ou sem ->all()), enums ou um só nome.
+        foreach (Collection::wrap($roles) as $role) {
+            if ($role instanceof BackedEnum) {
+                $role = $role->value;
+            }
+
+            if (is_int($role) || is_string($role) || $role instanceof Stringable) {
+                $names[] = (string) $role;
+            }
+        }
+
+        return array_values(array_unique(array_filter($names, fn (string $name): bool => $name !== '')));
+    }
+
+    protected function resolverFromConfig(): ?callable
     {
         $resolver = config('settings.resolve_roles');
 
-        if (is_callable($resolver)) {
-            return (array) $resolver($user);
+        if ($resolver === null || $resolver === '') {
+            return null;
         }
 
-        if (method_exists($user, 'getRoleNames')) {
-            return $user->getRoleNames()->all();
+        if (is_string($resolver) && class_exists($resolver)) {
+            $resolver = app($resolver); // classe com __invoke($user)
+        } elseif (is_array($resolver) && isset($resolver[0], $resolver[1]) && is_string($resolver[0]) && ! is_callable($resolver)) {
+            $resolver = [app($resolver[0]), $resolver[1]]; // [Classe::class, 'metodo']
         }
 
-        return [];
-    }
-
-    protected function parseDotKey(string $dotKey): array
-    {
-        $pos = strpos($dotKey, '.');
-
-        if ($pos === false) {
-            throw new \InvalidArgumentException(
-                "[gsebastiao/laravel-settings] Formato inválido: '{$dotKey}'. Use 'namespace.key'."
+        if (! is_callable($resolver)) {
+            throw new InvalidArgumentException(
+                "[gsebastiao/laravel-settings] config('settings.resolve_roles') tem de ser uma função, "
+                . "uma classe com __invoke(\$user) ou [Classe::class, 'metodo']."
             );
         }
 
-        return [substr($dotKey, 0, $pos), substr($dotKey, $pos + 1)];
+        return $resolver;
+    }
+
+    protected function pivotAvailable(): bool
+    {
+        return $this->pivotAvailable ??= SettingManager::tableExists();
     }
 }

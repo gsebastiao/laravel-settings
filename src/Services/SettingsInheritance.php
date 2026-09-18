@@ -2,250 +2,258 @@
 
 namespace Gsebastiao\LaravelSettings\Services;
 
+use Gsebastiao\LaravelSettings\Casts\SettingValueCast;
 use Gsebastiao\LaravelSettings\Models\Setting;
-use Illuminate\Database\Eloquent\Model;
+use Gsebastiao\LaravelSettings\Support\SettingKey;
 use Illuminate\Support\Collection;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\DB;
 
 /**
- * SettingsInheritance — copia settings de um contexto fonte para o contexto
- * de um utilizador recém-cadastrado.
+ * Copia settings marcadas com is_inheritable para o contexto de um utilizador.
  *
- * ── Filtro is_inheritable ─────────────────────────────────────────────────────
+ * NOTA: não precisas disto para um utilizador novo "ver" os valores globais —
+ * a leitura já faz fallback para o global. A cópia serve para o utilizador
+ * ficar com os valores do momento do registo: mudanças posteriores no global
+ * (ou no tenant) deixam de o afectar.
  *
- * Só settings marcadas explicitamente com is_inheritable=true são copiadas.
- * Isto evita que configurações internas (versão da app, credenciais de mail,
- * chaves de API) sejam copiadas para cada utilizador. Por defeito, uma nova
- * setting tem is_inheritable=false — precisas de a activar deliberadamente:
+ *   $inheritance = app(SettingsInheritance::class);
  *
- *   Settings::set('ui.theme', 'dark', options: ['is_inheritable' => true]);
+ *   $inheritance->forUser($user);                     // global → user
+ *   $inheritance->forUser($user, tenantId: 5);        // tenant:5 (ou global) → user
+ *   $inheritance->forUser($user, namespaces: ['ui']); // só o grupo 'ui'
+ *   $inheritance->preview($user);                     // mostra o que seria copiado
+ *   $inheritance->resetUser($user);                   // apaga as do user e copia de novo
  *
- * O valor de is_inheritable e de visibility são copiados juntos com o valor,
- * mantendo o comportamento consistente no contexto do utilizador.
- *
- * ── Modo normal (sem multitenancy) ───────────────────────────────────────────
- *
- *   app(SettingsInheritance::class)->forUser($user);
- *
- *   Copia as settings inheritable de 'global' para 'user:42'.
- *   O utilizador pode alterar as suas depois livremente.
- *
- * ── Modo SaaS multitenant ────────────────────────────────────────────────────
- *
- *   app(SettingsInheritance::class)->forUser($user, tenantId: 5);
- *
- *   Hierarquia de cópia: tenant:5 → global (tenant sobrepõe global).
- *   Só considera settings inheritable em qualquer dos dois contextos.
- *
- * ── Copiar só um namespace ───────────────────────────────────────────────────
- *
- *   app(SettingsInheritance::class)->forUser($user, namespaces: ['ui', 'mail']);
- *
- * ── Copiar de um contexto personalizado ──────────────────────────────────────
- *
- *   app(SettingsInheritance::class)->forUser($user, from: 'tenant:5');
- *
- * ── Verificar o que seria copiado (dry run) ──────────────────────────────────
- *
- *   $preview = app(SettingsInheritance::class)->preview($user, tenantId: 5);
+ * Só são copiadas settings com is_inheritable = true, e nunca por cima de um
+ * valor que o utilizador já tenha.
  */
 class SettingsInheritance
 {
-    public function __construct(
-        protected SettingsService $settings
-    ) {}
+    public function __construct(protected SettingsService $settings)
+    {
+    }
 
     /**
-     * Copia settings para o contexto do utilizador.
-     *
-     * Apenas settings com is_inheritable=true são consideradas — ver o filtro
-     * em loadCandidates(). Uma setting is_inheritable=false nunca aparece
-     * aqui, mesmo que exista no(s) contexto(s) fonte.
-     *
-     * @param  Model       $user        O utilizador recém-cadastrado
-     * @param  int|null    $tenantId    Se fornecido, activa o modo multitenant
-     * @param  array       $namespaces  Filtrar por namespaces; vazio = todos
-     * @param  string|null $from        Contexto fonte manual (sobrepõe tenantId)
-     * @return array{copied: int, skipped: int, namespaces: array}  Relatório
+     * @param  mixed  $user  model, ID ou null (utilizador autenticado)
+     * @param  mixed  $tenantId  copia primeiro do tenant e depois do global
+     * @param  array<int, string>  $namespaces  só estes grupos (vazio = todos)
+     * @param  string|null  $from  contexto de origem personalizado (em vez do tenant)
+     * @return array{copied: int, skipped: int, namespaces: array<int, string>}
      */
-    public function forUser(
-        Model   $user,
-        ?int    $tenantId   = null,
-        array   $namespaces = [],
-        ?string $from       = null,
-    ): array {
-        $userContext = SettingsService::userContext($user);
+    public function forUser(mixed $user, mixed $tenantId = null, array $namespaces = [], ?string $from = null): array
+    {
+        $plan = $this->plan($user, $tenantId, $namespaces, $from);
+        $copied = 0;
 
-        // Resolver as fontes por ordem de prioridade (primeiro ganha)
-        $sources = $this->resolveSources($tenantId, $from);
+        if ($plan['copy'] !== []) {
+            $copied = (new Setting())->getConnection()->transaction(
+                fn (): int => $this->copy($plan['userContext'], $plan['copy'])
+            );
 
-        // Carregar as settings de todas as fontes de uma só vez
-        $candidates = $this->loadCandidates($sources, $namespaces);
-
-        // Eliminar settings já existentes no contexto do user (não sobrescreve)
-        $existing = $this->loadExisting($userContext, $namespaces);
-
-        $toInsert  = [];
-        $skipped   = 0;
-
-        foreach ($candidates as $nsKey => $setting) {
-            if ($existing->has($nsKey)) {
-                $skipped++;
-                continue;
-            }
-
-            $toInsert[] = [
-                'namespace'      => $setting->namespace,
-                'key'            => $setting->key,
-                'context'        => $userContext,
-                'value'          => $setting->getRawOriginal('value'), // texto puro, sem cast
-                'cast'           => $setting->cast,
-                'is_locked'      => false, // user pode sempre editar as suas
-                'is_inheritable' => $setting->is_inheritable, // propaga a definição
-                'visibility'     => $setting->visibility,     // propaga a visibilidade
-                'metadata'       => $setting->getRawOriginal('metadata'),
-                'updated_by'     => Auth::id(),
-                'created_at'     => now(),
-                'updated_at'     => now(),
-            ];
-        }
-
-        // Insert em batch — muito mais eficiente do que N queries updateOrCreate
-        if (! empty($toInsert)) {
-            DB::table(config('settings.table', 'settings'))->insert($toInsert);
-        }
-
-        // Invalidar o cache para o contexto do user
-        foreach ($toInsert as $row) {
-            $this->settings->bustCache($row['namespace'], $row['key'], $userContext);
+            $this->settings->forgetCachedContexts($plan['userContext']);
         }
 
         return [
-            'copied'     => count($toInsert),
-            'skipped'    => $skipped,
-            'namespaces' => collect($toInsert)->pluck('namespace')->unique()->values()->all(),
+            'copied' => $copied,
+            'skipped' => count($plan['skip']),
+            'namespaces' => array_values(array_unique(array_map(
+                fn (array $item): string => $item['row']['namespace'],
+                array_values($plan['copy'])
+            ))),
         ];
     }
 
     /**
-     * Pré-visualiza o que seria copiado sem efectuar alterações (dry run).
-     * Útil para mostrar ao admin o que o utilizador vai herdar.
+     * O que forUser() faria, sem alterar nada.
      *
-     * @return Collection<string, array{namespace, key, value, cast, source}>
+     * @return Collection<string, array{namespace: string, key: string, value: mixed, cast: string, source: string, action: string}>
      */
-    public function preview(
-        Model   $user,
-        ?int    $tenantId   = null,
-        array   $namespaces = [],
-        ?string $from       = null,
-    ): Collection {
-        $userContext = SettingsService::userContext($user);
-        $sources     = $this->resolveSources($tenantId, $from);
-        $candidates  = $this->loadCandidates($sources, $namespaces);
-        $existing    = $this->loadExisting($userContext, $namespaces);
+    public function preview(mixed $user, mixed $tenantId = null, array $namespaces = [], ?string $from = null): Collection
+    {
+        $plan = $this->plan($user, $tenantId, $namespaces, $from);
 
-        return $candidates->map(function (Setting $setting, string $nsKey) use ($existing, $sources) {
-            return [
-                'namespace' => $setting->namespace,
-                'key'       => $setting->key,
-                'value'     => $setting->value,       // valor já castado
-                'cast'      => $setting->cast,
-                'source'    => $setting->context,     // 'global' ou 'tenant:5'
-                'action'    => $existing->has($nsKey) ? 'skip' : 'copy',
-            ];
+        return (new Collection($plan['candidates']))->map(fn (array $row, string $dot): array => [
+            'namespace' => $row['namespace'],
+            'key' => $row['key'],
+            'value' => SettingValueCast::decode($row['value'], $row['cast']),
+            'cast' => $row['cast'],
+            'source' => $row['context'],
+            'action' => isset($plan['skip'][$dot]) ? 'skip' : 'copy',
+        ]);
+    }
+
+    /**
+     * Apaga as settings do utilizador (dos grupos indicados) e copia de novo.
+     * Tudo numa transacção: se algo falhar, nada é apagado.
+     *
+     * @return array{copied: int, skipped: int, namespaces: array<int, string>}
+     */
+    public function resetUser(mixed $user, mixed $tenantId = null, array $namespaces = [], ?string $from = null): array
+    {
+        $userContext = SettingsService::userContext($user);
+
+        $report = (new Setting())->getConnection()->transaction(function () use ($user, $tenantId, $namespaces, $from, $userContext): array {
+            $query = Setting::withTrashed()->where('context', $userContext);
+
+            if ($namespaces !== []) {
+                $query->whereIn('namespace', $namespaces);
+            }
+
+            $query->forceDelete();
+
+            return $this->forUser($user, $tenantId, $namespaces, $from);
         });
+
+        $this->settings->forgetCachedContexts($userContext);
+
+        return $report;
     }
 
+    // ── Internos ─────────────────────────────────────────────────────────────
+
     /**
-     * Repõe as settings de um utilizador ao estado herdado (reset).
-     * Apaga todos os registos 'user:X' e copia novamente das fontes.
+     * @return array{userContext: string, candidates: array<string, array<string, mixed>>, copy: array<string, array{row: array<string, mixed>, trashed: bool}>, skip: array<string, array<string, mixed>>}
      */
-    public function resetUser(
-        Model   $user,
-        ?int    $tenantId   = null,
-        array   $namespaces = [],
-    ): array {
+    protected function plan(mixed $user, mixed $tenantId, array $namespaces, ?string $from): array
+    {
         $userContext = SettingsService::userContext($user);
+        $candidates = $this->loadCandidates($this->resolveSources($tenantId, $from), $namespaces);
+        $existing = $this->loadExisting($userContext, $namespaces);
+        $copy = [];
+        $skip = [];
 
-        $query = Setting::where('context', $userContext);
+        foreach ($candidates as $dot => $row) {
+            if (($existing[$dot] ?? null) === false) {
+                $skip[$dot] = $row; // o utilizador já tem valor próprio: não é sobrescrito
+            } else {
+                $copy[$dot] = ['row' => $row, 'trashed' => ($existing[$dot] ?? null) === true];
+            }
+        }
 
-        if (! empty($namespaces)) {
+        return ['userContext' => $userContext, 'candidates' => $candidates, 'copy' => $copy, 'skip' => $skip];
+    }
+
+    /**
+     * @param  array<string, array{row: array<string, mixed>, trashed: bool}>  $items
+     */
+    protected function copy(string $userContext, array $items): int
+    {
+        $model = new Setting();
+        $connection = $model->getConnection();
+        $now = $model->freshTimestamp();
+        $updatedBy = SettingsService::updatedBy();
+        $copied = 0;
+        $inserts = [];
+
+        foreach ($items as $item) {
+            $row = $item['row'];
+            $values = [
+                'value' => $row['value'], // texto tal como está na BD, sem conversões
+                'cast' => $row['cast'],
+                'is_locked' => false, // o utilizador pode sempre alterar as suas
+                'is_inheritable' => filter_var($row['is_inheritable'], FILTER_VALIDATE_BOOLEAN),
+                'visibility' => $row['visibility'],
+                'metadata' => $row['metadata'],
+                'updated_by' => $updatedBy,
+                'created_at' => $now,
+                'updated_at' => $now,
+                'deleted_at' => null,
+            ];
+
+            if ($item['trashed']) {
+                // Existiu e foi apagada com forget(): reaproveitamos a linha
+                // (inserir outra rebentava com chave duplicada).
+                $copied += $connection->table($model->getTable())
+                    ->where('namespace', $row['namespace'])
+                    ->where('key', $row['key'])
+                    ->where('context', $userContext)
+                    ->update($values);
+            } else {
+                $inserts[] = ['namespace' => $row['namespace'], 'key' => $row['key'], 'context' => $userContext] + $values;
+            }
+        }
+
+        foreach (array_chunk($inserts, 50) as $chunk) {
+            // insertOrIgnore: se outro pedido copiou o mesmo ao mesmo tempo, não rebenta.
+            $copied += $connection->table($model->getTable())->insertOrIgnore($chunk);
+        }
+
+        return $copied;
+    }
+
+    /**
+     * Contextos de origem, por prioridade: [tenant ou $from, global].
+     *
+     * @return array<int, string>
+     */
+    protected function resolveSources(mixed $tenantId, ?string $from): array
+    {
+        $first = $from !== null
+            ? SettingKey::context($from)
+            : ($tenantId !== null ? SettingsService::tenantContext($tenantId) : null);
+
+        return array_values(array_unique(array_filter([$first, SettingsService::globalContext()])));
+    }
+
+    /**
+     * Para cada chave, a linha do contexto de origem com mais prioridade — e só
+     * se essa linha for herdável. (Se o tenant tiver um valor próprio NÃO
+     * herdável, o valor do global não é copiado por cima dele.)
+     *
+     * @param  array<int, string>  $sources
+     * @return array<string, array<string, mixed>>
+     */
+    protected function loadCandidates(array $sources, array $namespaces): array
+    {
+        $query = Setting::query()->whereIn('context', $sources);
+
+        if ($namespaces !== []) {
             $query->whereIn('namespace', $namespaces);
         }
 
-        $query->forceDelete(); // ignora SoftDeletes para reset limpo
+        $winners = [];
 
-        return $this->forUser($user, $tenantId: $tenantId, namespaces: $namespaces);
-    }
+        foreach ($query->toBase()->get() as $row) {
+            $row = (array) $row;
+            $dot = SettingKey::join($row['namespace'], $row['key']);
+            $priority = array_search($row['context'], $sources, true);
 
-    // ── Helpers internos ──────────────────────────────────────────────────────
-
-    /**
-     * Resolve a lista de contextos fonte por ordem de prioridade.
-     * O primeiro contexto que tiver uma setting para dado namespace.key ganha.
-     *
-     * Modo normal:    ['global']
-     * Modo tenant:    ['tenant:5', 'global']
-     * Modo manual:    ['custom_context', 'global']
-     */
-    protected function resolveSources(?int $tenantId, ?string $from): array
-    {
-        if ($from !== null) {
-            return [$from, SettingsService::globalContext()];
+            if (! isset($winners[$dot]) || $priority < $winners[$dot]['priority']) {
+                $winners[$dot] = ['priority' => $priority, 'row' => $row];
+            }
         }
 
-        if ($tenantId !== null) {
-            return [SettingsService::tenantContext($tenantId), SettingsService::globalContext()];
+        $candidates = [];
+
+        foreach ($winners as $dot => $winner) {
+            if (filter_var($winner['row']['is_inheritable'], FILTER_VALIDATE_BOOLEAN)) {
+                $candidates[$dot] = $winner['row'];
+            }
         }
 
-        return [SettingsService::globalContext()];
+        ksort($candidates, SORT_STRING);
+
+        return $candidates;
     }
 
     /**
-     * Carrega as settings de todos os contextos fonte e resolve por prioridade.
-     * Retorna uma Collection keyed por 'namespace.key', o valor mais prioritário ganha.
+     * Settings que o utilizador já tem: 'grupo.nome' => está apagada (soft delete)?
      *
-     * IMPORTANTE: só considera settings com is_inheritable=true. Isto é o que
-     * impede que 'general.version', 'mail.smtp_password' ou qualquer setting
-     * interna seja copiada para o utilizador — nem entra na lista de candidatos.
-     *
-     * @return Collection<string, Setting>
+     * @return array<string, bool>
      */
-    protected function loadCandidates(array $sources, array $namespaces): Collection
-    {
-        $query = Setting::whereIn('context', $sources)->inheritable();
-
-        if (! empty($namespaces)) {
-            $query->whereIn('namespace', $namespaces);
-        }
-
-        // Agrupa por 'namespace.key' e escolhe o contexto mais prioritário
-        return $query->get()
-            ->groupBy(fn (Setting $s) => "{$s->namespace}.{$s->key}")
-            ->map(function (Collection $group) use ($sources) {
-                // Ordena pelo índice do sources array — menor índice = maior prioridade
-                return $group->sortBy(
-                    fn (Setting $s) => array_search($s->context, $sources)
-                )->first();
-            });
-    }
-
-    /**
-     * Carrega as settings já existentes no contexto do user.
-     *
-     * @return Collection<string, bool>  keyed por 'namespace.key'
-     */
-    protected function loadExisting(string $userContext, array $namespaces): Collection
+    protected function loadExisting(string $userContext, array $namespaces): array
     {
         $query = Setting::withTrashed()->where('context', $userContext);
 
-        if (! empty($namespaces)) {
+        if ($namespaces !== []) {
             $query->whereIn('namespace', $namespaces);
         }
 
-        return $query->get()
-            ->keyBy(fn (Setting $s) => "{$s->namespace}.{$s->key}")
-            ->map(fn () => true);
+        $existing = [];
+
+        foreach ($query->toBase()->get(['namespace', 'key', 'deleted_at']) as $row) {
+            $existing[SettingKey::join($row->namespace, $row->key)] = $row->deleted_at !== null;
+        }
+
+        return $existing;
     }
 }

@@ -2,53 +2,57 @@
 
 namespace Gsebastiao\LaravelSettings\Models;
 
+use BackedEnum;
+use Gsebastiao\LaravelSettings\Concerns\HasCompositeKey;
+use Gsebastiao\LaravelSettings\Support\SettingKey;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
-use Illuminate\Database\Schema\Builder as SchemaBuilder;
 use Illuminate\Support\Facades\Schema;
+use InvalidArgumentException;
+use RuntimeException;
 
 /**
- * SettingManager — pivot OPCIONAL que atribui a um utilizador ou role a
- * permissão de ver/editar uma setting específica, sobrepondo o 'visibility'
- * padrão dessa setting.
+ * Permissão OPCIONAL: dá a um utilizador ou a um role acesso a uma setting,
+ * num contexto, sobrepondo a `visibility` normal dessa setting.
  *
- * Esta tabela é criada automaticamente junto com 'settings' (mesma migration
- * ..._create_settings_tables.php), mas o SEU USO é opcional: enquanto nunca
- * chamares grant(), fica vazia e sem custo. Se a removeste manualmente da
- * base de dados, usa tableExists() para verificar antes de qualquer query —
- * o SettingsAccessControl já faz isso automaticamente, nunca vais precisar de
- * te preocupar com isto numa app simples.
+ * A tabela é criada pela migration do pacote, mas enquanto não chamares
+ * grant() fica vazia e não custa nada.
  *
- * ── Uso básico ────────────────────────────────────────────────────────────────
+ *   // O role 'manager' pode VER billing.plan no tenant 5
+ *   SettingManager::grant('billing.plan', context: 'tenant:5', type: 'role', id: 'manager');
  *
- *   // Dar a um role acesso de leitura a uma setting normalmente escondida
- *   SettingManager::grant('billing.plan', context: 'tenant:5',
- *       type: 'role', id: 'manager', visibility: 'readonly');
+ *   // O utilizador 42 pode EDITAR mail.from_name no global
+ *   SettingManager::grant('mail.from_name', context: 'global', type: 'user', id: 42, visibility: 'editable');
  *
- *   // Dar a um utilizador específico acesso de edição
- *   SettingManager::grant('mail.from_name', context: 'global',
- *       type: 'user', id: 42, visibility: 'editable');
+ *   // Retirar
+ *   SettingManager::revoke('billing.plan', context: 'tenant:5', type: 'role', id: 'manager');
  *
- *   // Revogar
- *   SettingManager::revoke('billing.plan', context: 'tenant:5',
- *       type: 'role', id: 'manager');
- *
- *   // Verificar se a tabela existe (para apps que nunca a migraram)
- *   SettingManager::tableExists(); // bool
+ * A permissão vale para o contexto em que foi dada.
  *
  * @property string $namespace
  * @property string $key
  * @property string $context
- * @property string $manager_type   'role' | 'user'
- * @property string $manager_id
- * @property string $visibility     'readonly' | 'editable'
+ * @property string $manager_type 'role' | 'user'
+ * @property string $manager_id nome do role ou ID do utilizador
+ * @property string $visibility 'readonly' | 'editable'
  */
 class SettingManager extends Model
 {
+    use HasCompositeKey;
     use SoftDeletes;
 
+    public const TYPES = ['role', 'user'];
+
+    public const VISIBILITIES = ['readonly', 'editable'];
+
     public $incrementing = false;
+
     protected $primaryKey = null;
+
+    protected $keyType = 'string';
+
+    /** @var array<int, string> */
+    protected array $compositeKey = ['namespace', 'key', 'context', 'manager_type', 'manager_id'];
 
     protected $fillable = [
         'namespace',
@@ -60,7 +64,7 @@ class SettingManager extends Model
     ];
 
     protected $casts = [
-        'manager_id' => 'string', // garante comparação consistente com user->id
+        'manager_id' => 'string', // comparação consistente com o ID do utilizador
     ];
 
     public function getTable(): string
@@ -68,122 +72,141 @@ class SettingManager extends Model
         return config('settings.managers_table', 'settings_managers');
     }
 
-    // ── Verificação de existência da tabela (cenário simples vs avançado) ──────
-
     /**
-     * Verifica se a tabela pivot existe na base de dados.
-     *
-     * NOTA: não é cacheado em variável estática de processo. Numa aplicação
-     * real o resultado raramente muda depois do boot, mas em suites de
-     * testes (Testbench) a base de dados é recriada entre testes — uma
-     * cache estática aqui fixaria o resultado do primeiro teste para todos
-     * os seguintes, criando falsos positivos/negativos. O custo de um
-     * hasTable() é desprezável comparado com esse risco.
-     *
-     * Se precisares de reduzir chamadas repetidas em produção, cacheia o
-     * resultado ao nível da aplicação (ex: Cache::rememberForever()) fora
-     * deste pacote, onde tens controlo sobre a invalidação.
+     * A tabela existe? (Podes apagá-la se nunca usares permissões.)
      */
     public static function tableExists(): bool
     {
-        /** @var SchemaBuilder $schema */
-        $schema = Schema::connection((new static())->getConnectionName());
+        $model = new static();
 
-        return $schema->hasTable(config('settings.managers_table', 'settings_managers'));
+        return Schema::connection($model->getConnectionName())->hasTable($model->getTable());
     }
 
-    // ── API de alto nível: grant / revoke ───────────────────────────────────────
-
     /**
-     * Concede a um utilizador ou role acesso a uma setting específica.
+     * Dá (ou actualiza) uma permissão.
      *
-     * @param  string  $dotKey     'namespace.key'
-     * @param  string  $context    Contexto da setting ('global', 'tenant:5', ...)
-     * @param  string  $type       'role' | 'user'
-     * @param  int|string $id      Nome do role ou ID do utilizador
-     * @param  string  $visibility 'readonly' | 'editable'
+     * @param  string  $type  'role' ou 'user'
+     * @param  int|string|Model|BackedEnum  $id  nome do role, ID do utilizador ou o próprio model
+     * @param  string  $visibility  'readonly' (ver) ou 'editable' (ver e editar)
      */
     public static function grant(
-        string     $dotKey,
-        string     $context,
-        string     $type,
-        int|string $id,
-        string     $visibility = 'readonly',
-    ): self {
-        if (! static::tableExists()) {
-            throw new \RuntimeException(
-                '[gsebastiao/laravel-settings] A tabela settings_managers não existe. '
-                . 'Corre: php artisan vendor:publish --tag=settings-migrations '
-                . 'e depois php artisan migrate.'
-            );
+        string $dotKey,
+        string $context,
+        string $type,
+        int|string|Model|BackedEnum $id,
+        string $visibility = 'readonly',
+    ): static {
+        $attributes = static::identify($dotKey, $context, $type, $id);
+
+        if (! in_array($visibility, static::VISIBILITIES, true)) {
+            throw new InvalidArgumentException(sprintf(
+                "[gsebastiao/laravel-settings] Visibilidade inválida numa permissão: '%s'. Usa 'readonly' ou 'editable'.",
+                $visibility
+            ));
         }
 
-        [$namespace, $key] = static::parseDotKey($dotKey);
+        static::ensureTableExists();
 
-        return static::updateOrCreate(
-            [
-                'namespace'    => $namespace,
-                'key'          => $key,
-                'context'      => $context,
-                'manager_type' => $type,
-                'manager_id'   => (string) $id,
-            ],
-            ['visibility' => $visibility]
-        );
+        // withTrashed(): uma permissão revogada volta a ser usada em vez de
+        // tentar inserir uma linha nova com a mesma chave (que rebentava).
+        $grant = static::withTrashed()->where($attributes)->first();
+
+        if ($grant === null) {
+            $grant = new static($attributes);
+        } elseif ($grant->trashed()) {
+            $grant->setAttribute($grant->getDeletedAtColumn(), null);
+        }
+
+        $grant->visibility = $visibility;
+        $grant->save();
+
+        return $grant;
     }
 
     /**
-     * Revoga o acesso previamente concedido (soft delete).
+     * Retira uma permissão. Devolve false se não existia.
      */
-    public static function revoke(
-        string     $dotKey,
-        string     $context,
-        string     $type,
-        int|string $id,
-    ): void {
+    public static function revoke(string $dotKey, string $context, string $type, int|string|Model|BackedEnum $id): bool
+    {
+        $attributes = static::identify($dotKey, $context, $type, $id);
+
         if (! static::tableExists()) {
-            return; // nada a revogar se a tabela nem existe
+            return false;
         }
 
-        [$namespace, $key] = static::parseDotKey($dotKey);
+        $grant = static::query()->where($attributes)->first();
 
-        static::where([
-            'namespace'    => $namespace,
-            'key'          => $key,
-            'context'      => $context,
-            'manager_type' => $type,
-            'manager_id'   => (string) $id,
-        ])->delete();
+        return $grant !== null && $grant->delete() !== false;
     }
 
     /**
-     * Concede acesso a vários roles/users de uma vez.
+     * Dá a mesma permissão a vários utilizadores/roles.
      *
      * @param  array<int, array{type: string, id: int|string}>  $managers
      */
-    public static function grantMany(
-        string $dotKey,
-        string $context,
-        array  $managers,
-        string $visibility = 'readonly',
-    ): void {
-        foreach ($managers as $manager) {
+    public static function grantMany(string $dotKey, string $context, array $managers, string $visibility = 'readonly'): void
+    {
+        foreach ($managers as $index => $manager) {
+            if (! is_array($manager) || ! isset($manager['type'], $manager['id'])) {
+                throw new InvalidArgumentException(sprintf(
+                    "[gsebastiao/laravel-settings] grantMany(): o item %s tem de ter 'type' e 'id', "
+                    . "por exemplo ['type' => 'role', 'id' => 'admin'].",
+                    $index
+                ));
+            }
+
             static::grant($dotKey, $context, $manager['type'], $manager['id'], $visibility);
         }
     }
 
-    // ── Helpers internos ──────────────────────────────────────────────────────
-
-    protected static function parseDotKey(string $dotKey): array
+    /**
+     * @return array<string, string>
+     */
+    protected static function identify(string $dotKey, string $context, string $type, mixed $id): array
     {
-        $pos = strpos($dotKey, '.');
+        [$namespace, $key] = SettingKey::parse($dotKey);
 
-        if ($pos === false) {
-            throw new \InvalidArgumentException(
-                "[gsebastiao/laravel-settings] Formato inválido: '{$dotKey}'. Use 'namespace.key'."
+        if (! in_array($type, static::TYPES, true)) {
+            throw new InvalidArgumentException(sprintf(
+                "[gsebastiao/laravel-settings] Tipo de permissão inválido: '%s'. Usa 'user' ou 'role'.",
+                $type
+            ));
+        }
+
+        if ($id instanceof Model) {
+            // Para roles guardamos o NOME (ex.: spatie/laravel-permission), não o id.
+            $id = $type === 'role' && $id->getAttribute('name') !== null ? $id->getAttribute('name') : $id->getKey();
+        }
+
+        if ($id instanceof BackedEnum) {
+            $id = $id->value;
+        }
+
+        $managerId = is_int($id) || is_string($id) ? (string) $id : '';
+
+        if ($managerId === '' || mb_strlen($managerId) > 64) {
+            throw new InvalidArgumentException(
+                '[gsebastiao/laravel-settings] Identificador inválido numa permissão: usa o ID do utilizador '
+                . 'ou o nome do role (até 64 caracteres).'
             );
         }
 
-        return [substr($dotKey, 0, $pos), substr($dotKey, $pos + 1)];
+        return [
+            'namespace' => $namespace,
+            'key' => $key,
+            'context' => SettingKey::context($context),
+            'manager_type' => $type,
+            'manager_id' => $managerId,
+        ];
+    }
+
+    protected static function ensureTableExists(): void
+    {
+        if (! static::tableExists()) {
+            throw new RuntimeException(sprintf(
+                "[gsebastiao/laravel-settings] A tabela '%s' não existe. Corre: php artisan migrate",
+                (new static())->getTable()
+            ));
+        }
     }
 }

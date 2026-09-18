@@ -3,6 +3,45 @@
 Todas as alterações relevantes a este pacote estão documentadas aqui.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt/1.0.0/).
 
+## [2.0.0] — Não publicado
+
+Versão de correcções. **Lê o [UPGRADE.md](UPGRADE.md)**: inclui um passo para verificares se os teus dados foram afectados pelo primeiro erro abaixo.
+
+### Corrigido
+- **Crítico:** `Settings::set()` sobre uma setting existente gravava o valor em **todas** as linhas da tabela (`UPDATE` sem `WHERE`, por causa da chave primária composta). Acontecia o mesmo em `SettingManager::grant()`. Os models passam a usar a chave composta em todas as operações (`save`, `delete`, `restore`, `refresh`, `find`, `chunk`, jobs...).
+- **Crítico:** erro de sintaxe em `SettingsInheritance::resetUser()`, presente desde a 1.0.0.
+- `forget()` seguido de `set()` da mesma chave rebentava com chave duplicada. Acontecia o mesmo com `revoke()` seguido de `grant()`.
+- `set()` sem `options` apagava `is_locked`, `is_inheritable`, `visibility` e `metadata`.
+- `is_locked` não tinha efeito nenhum.
+- `SettingsAccessControl` cortava a chave no primeiro ponto, por isso grupos com vários níveis apareciam como `hidden`.
+- `SettingsAccessControl` não encontrava settings vindas de um contexto mais geral (ex.: permissão num tenant para uma setting do global).
+- O tipo `date` gravava a data entre aspas e a leitura rebentava. As datas antigas continuam a ser lidas.
+- `SettingsInheritance` chamava um método protegido (`bustCache()`) e não voltava a copiar settings que o utilizador tinha apagado com `forget()`.
+- `userContext()` com um ID em texto (UUID) ignorava-o e usava o utilizador autenticado.
+- `updated_by` fazia a gravação falhar em MySQL/PostgreSQL quando os IDs dos utilizadores não eram numéricos.
+- Um `resolve_roles` que devolvia uma Collection (sem `->all()`) era mal interpretado.
+- Valores vindos de formulários (texto) mudavam o tipo da setting para `string`.
+- Dois pedidos a criar a mesma setting ao mesmo tempo podiam rebentar com chave duplicada.
+- A cache podia ficar com o valor antigo quando se gravava dentro de uma transacção.
+- Dois testes contradiziam o comportamento documentado (`forgetContext` e permissão por role).
+
+### Adicionado
+- API por contexto: `Settings::forUser($user)`, `Settings::forUser($user, tenant: 5)`, `Settings::forTenant(5)` e `Settings::forContext('shop:3')`.
+- Hierarquia utilizador → tenant → global, que estava documentada mas não implementada. Os parâmetros `context` aceitam uma lista de contextos.
+- `Settings::setMany()`, `find()`, `unlock()`, `isLocked()` e `flushCache()`.
+- Comando `php artisan settings:clear-cache`, também executado pelo `optimize:clear`.
+- `SettingsAccessControl::resolveRolesUsing()`, compatível com `config:cache`.
+- Scope `Setting::whereDotKey('ui.theme')`.
+- Mensagens de erro claras para chaves, tipos, opções e valores inválidos.
+- Suporte a enums e a IDs em texto (UUID/ULID).
+- Suite de testes com 91 testes, a passar em Laravel 11, 12 e 13.
+
+### Alterado
+- Cache por contexto, com memória por pedido: várias leituras numa página fazem uma só consulta. A cache é limpa automaticamente por qualquer gravação, incluindo gravações feitas directamente no model `Setting`.
+- Os serviços passam a ser registados como `scoped` (seguros com Octane e filas).
+- README reescrito para iniciantes. Novo guia UPGRADE.md.
+- `composer.json`: removido `pestphp/pest` (não era usado) e o email de exemplo; adicionados os scripts `test` e `format`.
+
 ## [1.2.0] — 2024-02-15
 
 ### Alterado

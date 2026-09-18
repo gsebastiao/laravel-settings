@@ -1,91 +1,79 @@
 <?php
 
+/*
+|--------------------------------------------------------------------------
+| gsebastiao/laravel-settings
+|--------------------------------------------------------------------------
+|
+| Nada aqui é obrigatório: o pacote funciona sem publicar este ficheiro.
+| Para o alterar: php artisan vendor:publish --tag=settings-config
+|
+*/
+
 return [
 
     /*
-    |--------------------------------------------------------------------------
-    | Cache
-    |--------------------------------------------------------------------------
-    |
-    | Configurações de cache para as settings. Por defeito usa o driver
-    | configurado no Laravel (config/cache.php). Define 'driver' => null
-    | para usar o driver por defeito, ou especifica 'redis', 'memcached', etc.
-    |
-    */
-    'cache' => [
-        'ttl'    => env('SETTINGS_CACHE_TTL', 300),      // segundos (5 min)
-        'prefix' => env('SETTINGS_CACHE_PREFIX', 'settings:'),
-        'driver' => env('SETTINGS_CACHE_DRIVER', null),  // null = driver padrão
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Tabela
-    |--------------------------------------------------------------------------
-    |
-    | Nome da tabela na base de dados. Útil em projetos multi-pacote para
-    | evitar colisões.
-    |
+    | Nome da tabela das settings. Muda-o ANTES de correr a migration — por
+    | exemplo, se já tens uma tabela chamada "settings" de outro pacote.
     */
     'table' => env('SETTINGS_TABLE', 'settings'),
 
     /*
-    |--------------------------------------------------------------------------
-    | Controlo de acesso (opcional)
-    |--------------------------------------------------------------------------
-    |
-    | Nome da tabela pivot para gestão granular por utilizador/role. É criada
-    | automaticamente pela mesma migration de 'settings', mas o USO é
-    | opcional — enquanto nunca chamares SettingManager::grant(), fica vazia
-    | e o pacote usa apenas o campo 'visibility' da tabela settings.
-    | Ver database/migrations/..._create_settings_tables.php
-    |
+    | Tabela das permissões por utilizador/role (funcionalidade avançada e
+    | opcional). Fica vazia se não a usares.
     */
     'managers_table' => env('SETTINGS_MANAGERS_TABLE', 'settings_managers'),
 
     /*
-    |--------------------------------------------------------------------------
-    | Resolução de roles do utilizador
-    |--------------------------------------------------------------------------
+    | Cache
     |
-    | O SettingsAccessControl precisa de saber quais roles um utilizador tem
-    | para verificar a tabela settings_managers. Por defeito assume que o
-    | model User tem um método getRoleNames(): array (compatível com
-    | spatie/laravel-permission). Podes sobrepor com um closure próprio:
+    | As settings ficam na cache do Laravel para não ir à base de dados em
+    | cada pedido. A cache é limpa automaticamente quando gravas uma setting.
+    | Se alterares a tabela à mão, corre: php artisan settings:clear-cache
     |
-    |   'resolve_roles' => fn ($user) => $user->roles->pluck('slug')->all(),
-    |
-    | Se o teu projecto não usa roles (cenário simples), ignora esta opção —
-    | só é chamada se a tabela settings_managers existir e tiver registos.
-    |
+    | enabled → false desliga a cache
+    | store   → store de config/cache.php (null = o store por defeito)
+    | ttl     → segundos até expirar (null = nunca expira)
+    | prefix  → prefixo das chaves na cache
     */
-    'resolve_roles' => null,
-
-    /*
-    |--------------------------------------------------------------------------
-    | Contextos
-    |--------------------------------------------------------------------------
-    |
-    | Define o contexto padrão e os prefixos usados pelo SettingsService.
-    | A hierarquia de resolução vai do mais específico ao mais geral:
-    |   user:42 → tenant:5 → global
-    |
-    */
-    'contexts' => [
-        'default' => 'global',
-        'user'    => 'user',    // prefixo: 'user:42'
-        'tenant'  => 'tenant',  // prefixo: 'tenant:5'
+    'cache' => [
+        'ttl' => env('SETTINGS_CACHE_TTL', 300),
+        'enabled' => env('SETTINGS_CACHE_ENABLED', true),
+        'prefix' => env('SETTINGS_CACHE_PREFIX', 'settings:'),
+        'store' => env('SETTINGS_CACHE_STORE', env('SETTINGS_CACHE_DRIVER')),
     ],
 
     /*
-    |--------------------------------------------------------------------------
-    | Cast padrão
-    |--------------------------------------------------------------------------
+    | Nomes dos contextos
     |
-    | Tipo de cast usado quando não é especificado ao gravar uma setting.
-    | Opções: string | int | float | bool | json | array | date
-    |
+    | 'default' é o contexto global (vale para toda a aplicação). Os outros
+    | são prefixos: Settings::forUser($user) usa 'user:42' e
+    | Settings::forTenant(5) usa 'tenant:5'.
     */
-    'default_cast' => 'string',
+    'contexts' => [
+        'user' => env('SETTINGS_CONTEXT_USER', 'user'),
+        'tenant' => env('SETTINGS_CONTEXT_TENANT', 'tenant'),
+        'default' => env('SETTINGS_CONTEXT_DEFAULT', 'global'),
+    ],
+
+    /*
+    | Tipo usado quando gravas texto numa setting nova sem indicar `cast`.
+    | Opções: string, int, float, bool, json, array, date
+    */
+    'default_cast' => env('SETTINGS_DEFAULT_CAST', 'string'),
+
+    /*
+    | Como obter os roles de um utilizador (só para as permissões avançadas).
+    |
+    | null → usa $user->getRoleNames() se existir (spatie/laravel-permission).
+    |
+    | Para outra solução, o mais simples é chamar no boot() do AppServiceProvider:
+    |
+    |   SettingsAccessControl::resolveRolesUsing(fn ($user) => $user->roles->pluck('slug'));
+    |
+    | Aqui também aceita uma classe com __invoke($user) ou [Classe::class, 'metodo'].
+    | Não escrevas uma função (fn) neste ficheiro: impede o php artisan config:cache.
+    */
+    'resolve_roles' => env('SETTINGS_RESOLVE_ROLE', null),
 
 ];

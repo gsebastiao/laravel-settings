@@ -1,67 +1,54 @@
 <?php
 
+use Gsebastiao\LaravelSettings\Contracts\SettingsRepository;
 use Gsebastiao\LaravelSettings\Services\SettingsService;
 
 if (! function_exists('setting')) {
     /**
-     * Helper global para aceder a settings. Semelhante ao helper config().
+     * Lê uma setting — como o config() do Laravel.
      *
-     *   // Ler com default
-     *   setting('general.name', 'Laravel App')
+     *   setting('app.name')                        // valor ou null
+     *   setting('app.name', 'Minha App')           // com valor por defeito
+     *   setting('ui.theme', 'light', 'user:42')    // num contexto
+     *   setting()->set('app.name', 'Loja do Zé')   // sem argumentos: o serviço
      *
-     *   // Ler com contexto do utilizador autenticado
-     *   setting('ui.theme', 'light', context: SettingsService::userContext())
-     *
-     *   // Aceder ao serviço completo (para set/forget/lock)
-     *   setting()->set('ui.theme', 'dark', context: 'user:42')
-     *
-     * @param  string|null  $key
-     * @param  mixed        $default
-     * @param  string       $context
-     * @return mixed|\Gsebastiao\LaravelSettings\Services\SettingsService
+     * @return ($key is null ? SettingsRepository : mixed)
      */
-    function setting(
-        ?string $key     = null,
-        mixed   $default = null,
-        string  $context = 'global'
-    ): mixed {
-        /** @var SettingsService $service */
-        $service = app('settings');
+    function setting(?string $key = null, mixed $default = null, string|array|null $context = null): mixed
+    {
+        /** @var SettingsRepository $settings */
+        $settings = app('settings');
 
-        if ($key === null) {
-            return $service;
-        }
-
-        return $service->get($key, $default, $context);
+        return $key === null ? $settings : $settings->get($key, $default, $context);
     }
 }
 
 if (! function_exists('userSetting')) {
     /**
-     * Lê uma setting no contexto do utilizador autenticado,
-     * com fallback automático para o valor global.
+     * Lê uma setting do utilizador autenticado (ou do $user indicado), com
+     * fallback para o valor global. Para visitantes devolve o valor global.
      *
-     *   userSetting('ui.font_size', 14)
-     *   // → tenta 'user:42', depois 'global'
+     *   userSetting('ui.theme', 'light')
+     *   userSetting('ui.theme', 'light', user: $user)
      */
     function userSetting(string $key, mixed $default = null, mixed $user = null): mixed
     {
-        return setting($key, $default, context: SettingsService::userContext($user));
+        $user ??= SettingsService::authenticatedUserId();
+
+        return setting($key, $default, $user === null ? null : SettingsService::userContext($user));
     }
 }
 
 if (! function_exists('tenantSetting')) {
     /**
-     * Lê uma setting no contexto de um tenant, com fallback para global.
+     * Lê uma setting de um tenant, com fallback para o valor global.
      *
      *   tenantSetting('ui.logo', 'logo.png', tenantId: 5)
      */
-    function tenantSetting(string $key, mixed $default = null, int $tenantId = 0): mixed
+    function tenantSetting(string $key, mixed $default = null, mixed $tenantId = null): mixed
     {
-        $context = $tenantId > 0
-            ? SettingsService::tenantContext($tenantId)
-            : SettingsService::globalContext();
+        $context = in_array($tenantId, [null, 0, ''], true) ? null : SettingsService::tenantContext($tenantId);
 
-        return setting($key, $default, context: $context);
+        return setting($key, $default, $context);
     }
 }

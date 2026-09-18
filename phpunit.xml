@@ -2,10 +2,11 @@
 <phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
          bootstrap="vendor/autoload.php"
+         cacheDirectory=".phpunit.cache"
          colors="true"
 >
     <testsuites>
-        <testsuite name="Ahol Settings">
+        <testsuite name="Laravel Settings">
             <directory>tests</directory>
         </testsuite>
     </testsuites>
@@ -18,8 +19,8 @@
 
     <php>
         <env name="APP_ENV" value="testing"/>
-        <env name="DB_CONNECTION" value="sqlite"/>
-        <env name="DB_DATABASE" value=":memory:"/>
+        <env name="DB_CONNECTION" value="testing"/>
+        <env name="CACHE_STORE" value="array"/>
         <env name="CACHE_DRIVER" value="array"/>
     </php>
 </phpunit>

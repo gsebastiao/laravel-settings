@@ -2,6 +2,8 @@
 
 namespace Gsebastiao\LaravelSettings;
 
+use Gsebastiao\LaravelSettings\Console\ClearCacheCommand;
+use Gsebastiao\LaravelSettings\Contracts\SettingsRepository;
 use Gsebastiao\LaravelSettings\Services\SettingsAccessControl;
 use Gsebastiao\LaravelSettings\Services\SettingsInheritance;
 use Gsebastiao\LaravelSettings\Services\SettingsService;
@@ -11,71 +13,55 @@ class SettingsServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        // Mescla a configuração publicável com os valores por defeito do pacote
-        $this->mergeConfigFrom(
-            __DIR__ . '/../config/settings.php',
-            'settings'
-        );
+        $this->mergeConfigFrom(__DIR__ . '/../config/settings.php', 'settings');
 
-        // Singleton — uma instância partilhada com cache interno
-        $this->app->singleton(SettingsService::class, function ($app) {
+        // "scoped": uma instância por pedido HTTP / job da fila. O serviço
+        // guarda em memória as settings lidas durante o pedido; assim essa
+        // memória nunca passa para o pedido seguinte (Octane, filas).
+        $this->app->scoped(SettingsService::class, function ($app) {
+            $config = $app['config'];
+            $ttl = $config->get('settings.cache.ttl', 300);
+            $ttl = $ttl === null || $ttl === '' ? null : (int) $ttl;
+
             return new SettingsService(
-                cacheTtl:    $app['config']->get('settings.cache.ttl', 300),
-                cachePrefix: $app['config']->get('settings.cache.prefix', 'settings:'),
-                cacheDriver: $app['config']->get('settings.cache.driver'),
+                cacheTtl: $ttl,
+                cachePrefix: (string) $config->get('settings.cache.prefix', 'settings:'),
+                cacheDriver: $config->get('settings.cache.store') ?? $config->get('settings.cache.driver'),
+                cacheEnabled: filter_var($config->get('settings.cache.enabled', true), FILTER_VALIDATE_BOOLEAN)
+                    && ($ttl === null || $ttl > 0),
             );
         });
 
-        // Alias curto para resolução via app('settings')
-        $this->app->alias(SettingsService::class, 'settings');
+        $this->app->scoped(SettingsRepository::class, fn ($app) => $app->make(SettingsService::class));
+        $this->app->alias(SettingsRepository::class, 'settings');
 
-        // SettingsInheritance — injeta o SettingsService automaticamente
-        $this->app->singleton(SettingsInheritance::class, function ($app) {
-            return new SettingsInheritance(
-                settings: $app->make(SettingsService::class),
-            );
-        });
-
-        // SettingsAccessControl — resolve visibilidade final por utilizador.
-        // Sem dependências no construtor; funciona mesmo sem settings_managers.
-        $this->app->singleton(SettingsAccessControl::class);
+        $this->app->scoped(SettingsInheritance::class);
+        $this->app->scoped(SettingsAccessControl::class);
     }
 
     public function boot(): void
     {
-        if ($this->app->runningInConsole()) {
-            // ── Publicar configuração ─────────────────────────────────────────
-            $this->publishes([
-                __DIR__ . '/../config/settings.php' => config_path('settings.php'),
-            ], 'settings-config');
+        // A migration é carregada automaticamente: basta `php artisan migrate`.
+        $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
 
-            // ── Publicar a migration ─────────────────────────────────────────
-            // Um único ficheiro cria as duas tabelas (settings + settings_managers).
-            // Publica para editar antes de migrar — por exemplo, para remover o
-            // bloco da settings_managers se nunca fores usar controlo de acesso
-            // granular, ou para adicionar a FK de updated_by.
-            $this->publishes([
-                __DIR__ . '/../database/migrations/' => database_path('migrations'),
-            ], 'settings-migrations');
-
-            // ── Publicar tudo de uma vez ──────────────────────────────────────
-            $this->publishes([
-                __DIR__ . '/../config/settings.php'   => config_path('settings.php'),
-                __DIR__ . '/../database/migrations/'  => database_path('migrations'),
-            ], 'settings');
+        if (! $this->app->runningInConsole()) {
+            return;
         }
 
-        // Carrega a migration automaticamente — cria as duas tabelas
-        // (settings + settings_managers) sem precisar de publicar nada.
-        //
-        // A tabela settings_managers é opcional NO USO, não na criação: fica
-        // vazia e sem qualquer custo se nunca chamares SettingManager::grant().
-        // Se preferires não a ter de todo na base de dados, publica a
-        // migration (comando acima) e remove o segundo Schema::create()
-        // antes de correr `php artisan migrate`, ou apaga-a depois com
-        // Schema::dropIfExists(config('settings.managers_table')) — o
-        // SettingsAccessControl detecta a ausência da tabela em runtime e
-        // simplesmente ignora o pivot.
-        $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
+        $config = [__DIR__ . '/../config/settings.php' => config_path('settings.php')];
+        // O ficheiro publicado mantém o nome original, por isso o Laravel
+        // reconhece-o e não corre a migration duas vezes.
+        $migrations = [__DIR__ . '/../database/migrations' => database_path('migrations')];
+
+        $this->publishes($config, 'settings-config');
+        $this->publishes($migrations, 'settings-migrations');
+        $this->publishes($config + $migrations, 'settings');
+
+        $this->commands([ClearCacheCommand::class]);
+
+        // php artisan optimize:clear também limpa a cache das settings (Laravel 11.27+).
+        if (method_exists($this, 'optimizes')) {
+            $this->optimizes(clear: 'settings:clear-cache', key: 'settings');
+        }
     }
 }
